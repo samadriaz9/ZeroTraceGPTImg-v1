@@ -170,34 +170,113 @@ def run_git(dir, name, command, desc=None, errdesc=None, custom_env=None, live: 
     return run(f'"{git}" -C "{dir}" {command}', desc=desc, errdesc=errdesc, custom_env=custom_env, live=live)
 
 
-def git_clone(url, dir, name, commithash=None):
+def git_clone(url, dir, name, commithash=None, optional=False):
     # TODO clone into temporary dir and move if successful
 
     if os.path.exists(dir):
-        if commithash is None:
-            return
+        # Check if it's actually a git repository
+        if os.path.exists(os.path.join(dir, '.git')):
+            print(f"Found existing {name} repository at {dir}, using it...")
+            if commithash is None:
+                return
 
-        current_hash = run_git(dir, name, 'rev-parse HEAD', None, f"Couldn't determine {name}'s hash: {commithash}", live=False).strip()
-        if current_hash == commithash:
-            return
+            try:
+                current_hash = run_git(dir, name, 'rev-parse HEAD', None, f"Couldn't determine {name}'s hash: {commithash}", live=False).strip()
+                if current_hash == commithash:
+                    print(f"  {name} is already at the correct commit ({commithash[:8]}...)")
+                    return
 
-        if run_git(dir, name, 'config --get remote.origin.url', None, f"Couldn't determine {name}'s origin URL", live=False).strip() != url:
-            run_git(dir, name, f'remote set-url origin "{url}"', None, f"Failed to set {name}'s origin URL", live=False)
+                # Try to update remote URL if it's different (but don't fail if it fails)
+                try:
+                    current_url = run_git(dir, name, 'config --get remote.origin.url', None, f"Couldn't determine {name}'s origin URL", live=False).strip()
+                    if current_url != url:
+                        print(f"  Updating {name} remote URL from {current_url} to {url}")
+                        run_git(dir, name, f'remote set-url origin "{url}"', None, f"Failed to set {name}'s origin URL", live=False)
+                except:
+                    pass  # Ignore if we can't update remote URL
 
-        run_git(dir, name, 'fetch', f"Fetching updates for {name}...", f"Couldn't fetch {name}", autofix=False)
+                # Try to fetch and checkout, but don't fail if unavailable
+                try:
+                    run_git(dir, name, 'fetch', f"Fetching updates for {name}...", f"Couldn't fetch {name}", autofix=False)
+                    run_git(dir, name, f'checkout {commithash}', f"Checking out commit for {name} with hash: {commithash}...", f"Couldn't checkout commit {commithash} for {name}", live=True)
+                    print(f"  Successfully updated {name} to commit {commithash[:8]}...")
+                except RuntimeError as fetch_error:
+                    error_msg = str(fetch_error).lower()
+                    # If remote is unavailable but repo exists locally, use it as-is
+                    if "could not read username" in error_msg or "repository not found" in error_msg or "fatal: could not read" in error_msg or "no such device" in error_msg:
+                        print(f"  Remote repository unavailable, but local {name} repository exists.")
+                        print(f"  Using existing local repository. If you need a specific commit, update manually.")
+                    else:
+                        print(f"  Warning: Could not update {name} to commit {commithash}, using existing version")
+                        if not optional:
+                            print(f"  This may cause compatibility issues. Consider updating manually.")
 
-        run_git(dir, name, f'checkout {commithash}', f"Checking out commit for {name} with hash: {commithash}...", f"Couldn't checkout commit {commithash} for {name}", live=True)
-
-        return
+                return
+            except RuntimeError as e:
+                # If repository exists but git operations fail, check if it's usable
+                error_msg = str(e)
+                if "not a git repository" in error_msg.lower() or "not found" in error_msg.lower():
+                    if not optional:
+                        print(f"Warning: Directory {dir} exists but is not a valid git repository.")
+                        print(f"  Attempting to re-clone...")
+                        shutil.rmtree(dir, ignore_errors=True)
+                else:
+                    # Other git errors - repository might be corrupted but let's try to use it
+                    print(f"Warning: Could not verify {name} repository, but directory exists.")
+                    print(f"  Using existing repository as-is. If you encounter issues, delete {dir} and re-run.")
+                    return
+        else:
+            # Directory exists but is not a git repo - remove it
+            print(f"Warning: Directory {dir} exists but is not a git repository. Removing...")
+            shutil.rmtree(dir, ignore_errors=True)
 
     try:
         run(f'"{git}" clone --config core.filemode=false "{url}" "{dir}"', f"Cloning {name} into {dir}...", f"Couldn't clone {name}", live=True)
-    except RuntimeError:
-        shutil.rmtree(dir, ignore_errors=True)
-        raise
+    except RuntimeError as e:
+        error_msg = str(e)
+        if optional:
+            print(f"Warning: Could not clone {name} from {url}")
+            print(f"  Error: {error_msg}")
+            print(f"  Continuing without {name} repository...")
+            print(f"  If you need {name}, you can clone it manually:")
+            print(f"    git clone {url} {dir}")
+            return
+        else:
+            # Check if repository is unavailable/private
+            unavailable_errors = [
+                "could not read username",
+                "repository not found",
+                "fatal: could not read",
+                "no such device",
+                "authentication failed",
+                "permission denied"
+            ]
+            if any(err in error_msg.lower() for err in unavailable_errors):
+                print(f"Warning: Repository {name} appears to be unavailable or private.")
+                print(f"  URL: {url}")
+                print(f"  Error: {error_msg}")
+                print(f"  If the repository already exists locally at {dir}, the application will use it.")
+                print(f"  Otherwise, you may need to clone it manually or use an alternative repository.")
+                if os.path.exists(dir) and os.path.exists(os.path.join(dir, '.git')):
+                    print(f"  Using existing repository at {dir}")
+                    return
+                else:
+                    # If optional, don't raise - just warn
+                    if optional:
+                        print(f"  Continuing without {name} repository...")
+                        return
+                    raise RuntimeError(f"Repository {name} is unavailable and not found locally. Please clone it manually or set an alternative URL via environment variable.")
+            shutil.rmtree(dir, ignore_errors=True)
+            raise
 
     if commithash is not None:
-        run(f'"{git}" -C "{dir}" checkout {commithash}', None, "Couldn't checkout {name}'s hash: {commithash}")
+        try:
+            run(f'"{git}" -C "{dir}" checkout {commithash}', None, f"Couldn't checkout {name}'s hash: {commithash}")
+        except RuntimeError:
+            if optional:
+                print(f"Warning: Could not checkout commit {commithash} for {name}, using default branch")
+            else:
+                raise
 
 
 def git_pull_recursive(dir):
@@ -487,7 +566,10 @@ def prepare_environment():
     os.makedirs(os.path.join(script_path, dir_repos), exist_ok=True)
 
     git_clone(assets_repo, repo_dir('stable-diffusion-webui-assets'), "assets", assets_commit_hash)
-    git_clone(stable_diffusion_repo, repo_dir('stable-diffusion-stability-ai'), "Stable Diffusion", stable_diffusion_commit_hash)
+    
+    # Stable Diffusion repo may be unavailable - git_clone will handle existing repos gracefully
+    git_clone(stable_diffusion_repo, repo_dir('stable-diffusion-stability-ai'), "Stable Diffusion", stable_diffusion_commit_hash, optional=True)
+    
     git_clone(stable_diffusion_xl_repo, repo_dir('generative-models'), "Stable Diffusion XL", stable_diffusion_xl_commit_hash)
     git_clone(k_diffusion_repo, repo_dir('k-diffusion'), "K-diffusion", k_diffusion_commit_hash)
     git_clone(blip_repo, repo_dir('BLIP'), "BLIP", blip_commit_hash)
